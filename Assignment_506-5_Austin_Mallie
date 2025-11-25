@@ -1,0 +1,217 @@
+library(shiny)
+library(tidyverse)
+library(tsibble)
+library(fable)
+library(fabletools)
+library(feasts)
+library(lubridate)
+library(janitor)
+
+##  DATA PREP 
+
+wines_raw <- readr::read_csv("AustralianWines.csv")  
+
+wines <- wines_raw |>
+  clean_names() |>
+  mutate(
+    # "Jan-80" -> Date 1980-01-01
+    month = my(month)
+  ) |>
+  # make sure ALL wine columns are numeric
+  mutate(
+    across(-month, as.numeric)
+  ) |>
+  pivot_longer(
+    cols      = -month,
+    names_to  = "varietal",
+    values_to = "sales"
+  )
+
+wines_ts <- wines |>
+  as_tsibble(index = month, key = varietal)
+
+##  UI 
+
+ui <- fluidPage(
+  titlePanel("Australian Wine Sales: Forecasting by Varietal"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput(
+        "varietal",
+        "Choose varietal(s):",
+        choices = NULL,
+        multiple = TRUE
+      ),
+      dateRangeInput(
+        "date_range",
+        "Analysis date range:",
+        start = min(wines_ts$month),
+        end   = max(wines_ts$month),
+        format = "yyyy-mm"
+      ),
+      sliderInput(
+        "train_end",
+        "Training period ends:",
+        min   = min(wines_ts$month),
+        max   = max(wines_ts$month),
+        value = as.Date("1991-12-01"),
+        timeFormat = "%Y-%m"
+      ),
+      numericInput(
+        "h",
+        "Forecast horizon (months):",
+        value = 12,
+        min = 1,
+        max = 60
+      )
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Forecast plot", plotOutput("fc_plot")),
+        tabPanel("Accuracy table", tableOutput("acc_table")),
+        tabPanel("Model specs", verbatimTextOutput("model_specs")),
+        tabPanel("About", htmlOutput("about"))
+      )
+    )
+  )
+)
+
+##  SERVER 
+
+server <- function(input, output, session) {
+  
+  # initialize varietal choices
+  observe({
+    updateSelectInput(
+      session,
+      "varietal",
+      choices  = sort(unique(wines_ts$varietal)),
+      selected = "sparkling"
+    )
+  })
+  
+  # Filter by user inputs and keep tsibble structure
+  filtered_ts <- reactive({
+    req(input$varietal, input$date_range)
+    
+    wines_ts |>
+      filter(
+        varietal %in% input$varietal,
+        month >= input$date_range[1],
+        month <= input$date_range[2]
+      )
+  })
+  
+  # Train / validation split
+  train_data <- reactive({
+    req(filtered_ts(), input$train_end)
+    filtered_ts() |>
+      filter(month <= input$train_end)
+  })
+  
+  valid_data <- reactive({
+    req(filtered_ts(), input$train_end)
+    filtered_ts() |>
+      filter(month > input$train_end)
+  })
+  
+  # Fit models per varietal
+  models <- reactive({
+    req(train_data())
+    train_data() |>
+      model(
+        TSLM  = TSLM(sales ~ trend() + season()),
+        ETS   = ETS(sales),
+        ARIMA = ARIMA(sales)
+      )
+  })
+  
+  # Forecast into the future (h months)
+  fc_future <- reactive({
+    req(models(), input$h)
+    models() |>
+      forecast(h = input$h)
+  })
+  
+  # Forecast over validation window for scoring
+  fc_valid <- reactive({
+    req(models(), valid_data())
+    vdat <- valid_data()
+    if (nrow(vdat) == 0) return(NULL)
+    
+    models() |>
+      forecast(new_data = vdat)
+  })
+  
+  ## TRAINING ACCURACY (uses built-in training data) 
+  acc_train <- reactive({
+    req(models())
+    fabletools::accuracy(models()) |>
+      dplyr::mutate(Window = "Train") |>
+      dplyr::select(varietal, .model, Window, RMSE, MAE, MAPE)
+  })
+  
+  ## VALIDATION ACCURACY (forecasts vs validation data) 
+  acc_valid <- reactive({
+    fv   <- fc_valid()
+    vdat <- valid_data()
+    
+    if (is.null(fv) || is.null(vdat) || nrow(vdat) == 0)
+      return(NULL)
+    
+    fabletools::accuracy(fv, vdat) |>
+      dplyr::mutate(Window = "Validation") |>
+      dplyr::select(varietal, .model, Window, RMSE, MAE, MAPE)
+  })
+  
+  ## COMBINED TABLE 
+  acc_all <- reactive({
+    at <- acc_train()
+    av <- acc_valid()
+    
+    if (is.null(av)) {
+      at
+    } else {
+      dplyr::bind_rows(at, av)
+    }
+  })
+  
+  output$acc_table <- renderTable({
+    req(acc_all())
+    acc_all()
+  })
+  
+  # Forecast plot: historical + future forecasts with ribbons
+  output$fc_plot <- renderPlot({
+    req(fc_future(), train_data())
+    fc_future() |>
+      autoplot(train_data(), level = c(80, 95)) +
+      labs(
+        x = "Month",
+        y = "Sales (thousands of liters)",
+        title = "Forecasts for Selected Wine Varietals",
+        subtitle = "TSLM, ETS, and ARIMA models with prediction intervals"
+      )
+  })
+  
+  # Model specs tab
+  output$model_specs <- renderPrint({
+    req(models())
+    fabletools::report(models())
+  })
+  
+  # About tab text
+  output$about <- renderUI({
+    HTML(paste(
+      "<p>This app uses monthly Australian wine sales data (1980–1994) to model and",
+      "forecast demand by varietal. For each selected varietal, three time series",
+      "models are fit on a user-chosen training period: TSLM with trend and seasonal",
+      "terms, ETS, and ARIMA. Forecasts and validation metrics help compare model",
+      "performance, especially around seasonal peaks such as end-of-year holidays.</p>"
+    ))
+  })
+}
+
+## -------- LAUNCH APP --------
+
+shinyApp(ui = ui, server = server)
